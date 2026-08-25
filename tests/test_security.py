@@ -64,6 +64,8 @@ class SecurityTests(unittest.TestCase):
         self.assertEqual(
             server.sonarr_set_quality_profile_qualities(-1, allow="x"), "Invalid profile_id."
         )
+        self.assertEqual(server.radarr_set_movie_tags(0, tags="x"), "Invalid movie_id.")
+        self.assertEqual(server.sonarr_set_series_tags(-1, tags="x"), "Invalid series_id.")
 
     def test_dns_rebinding_protection_is_enabled(self):
         settings = server.mcp.settings.transport_security

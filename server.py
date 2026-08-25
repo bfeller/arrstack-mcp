@@ -285,6 +285,24 @@ def _apply_quality_allowlist(items, allow_lower: set, disallow_lower: set):
     return changed, not_found
 
 
+def _resolve_tag_ids(all_tags: list, tags_csv: str):
+    """Resolve a comma-separated list of tag labels to their IDs against
+    `all_tags` ([{id,label}, ...]). Returns (resolved_ids, unmatched_labels).
+    """
+    label_to_id = {t["label"].lower(): t["id"] for t in all_tags}
+    ids, unmatched = [], []
+    for raw in tags_csv.split(","):
+        label = raw.strip()
+        if not label:
+            continue
+        tid = label_to_id.get(label.lower())
+        if tid is None:
+            unmatched.append(label)
+        else:
+            ids.append(tid)
+    return ids, unmatched
+
+
 def _sonarr(path: str, method: str = "GET", json=None, params=None):
     if not SONARR_URL:
         return "Sonarr is not configured. Set SONARR_URL and SONARR_API_KEY."
@@ -702,7 +720,7 @@ def _bookshelf(path: str, method: str = "GET", json=None, params=None):
 
 @mcp.tool()
 def sonarr_list_series() -> str:
-    """List all TV series in Sonarr with monitoring status, episode counts, and disk usage."""
+    """List all TV series in Sonarr with monitoring status, episode counts, disk usage, and tags."""
     data = _sonarr("/series")
     if isinstance(data, str):
         return data
@@ -710,6 +728,12 @@ def sonarr_list_series() -> str:
     try:
         for p in _sonarr("/qualityprofile"):
             profiles[p["id"]] = p["name"]
+    except Exception:
+        pass
+    tag_labels = {}
+    try:
+        for t in _sonarr("/tag"):
+            tag_labels[t["id"]] = t["label"]
     except Exception:
         pass
     lines = []
@@ -720,9 +744,11 @@ def sonarr_list_series() -> str:
         size_gb = stats.get("sizeOnDisk", 0) / 1e9
         icon = "✅" if s.get("monitored") else "⏸️"
         profile_name = profiles.get(s.get("qualityProfileId"), "?")
+        tags = ", ".join(tag_labels.get(tid, str(tid)) for tid in s.get("tags", []))
+        tags_str = f" [tags: {tags}]" if tags else ""
         lines.append(
             f"{icon} [id:{s['id']}] {s['title']} ({s.get('year', '?')}) — "
-            f"{have}/{total} episodes, {size_gb:.1f} GB [profile: {profile_name}]"
+            f"{have}/{total} episodes, {size_gb:.1f} GB [profile: {profile_name}]{tags_str}"
         )
     return "\n".join(lines) or "No series found."
 
@@ -744,6 +770,12 @@ def sonarr_get_series(series_id: int) -> str:
                 break
     except Exception:
         pass
+    tag_names = []
+    try:
+        tag_labels = {t["id"]: t["label"] for t in _sonarr("/tag")}
+        tag_names = [tag_labels.get(tid, str(tid)) for tid in s.get("tags", [])]
+    except Exception:
+        pass
     lines = [
         f"Title: {s['title']} ({s.get('year', '?')})",
         f"Sonarr ID: {s['id']}",
@@ -751,6 +783,7 @@ def sonarr_get_series(series_id: int) -> str:
         f"Network: {s.get('network', '?')}",
         f"Quality Profile: [{s.get('qualityProfileId', '?')}] {profile_name}",
         f"Monitored: {s.get('monitored', False)}",
+        f"Tags: {', '.join(tag_names) or 'none'}",
         f"Seasons: {stats.get('seasonCount', '?')}",
         f"Episodes: {stats.get('episodeFileCount', 0)}/{stats.get('episodeCount', 0)}",
         f"Size: {stats.get('sizeOnDisk', 0) / 1e9:.1f} GB",
@@ -1072,6 +1105,93 @@ def sonarr_update_series(series_id: int, quality_profile_id: int = -1, monitored
         return f"❌ Failed: {e.response.status_code} — {e.response.text[:200]}"
 
 
+@mcp.tool()
+def sonarr_list_tags() -> str:
+    """List all tags defined in Sonarr, with how many series each is applied to.
+    Sonarr/Seerr can auto-tag series by requesting user — useful for scoping
+    actions to what a specific person requested."""
+    data = _sonarr("/tag/detail")
+    if isinstance(data, str):
+        return data
+    lines = [f"• [{t['id']}] {t['label']} — {len(t.get('seriesIds', []))} series" for t in data]
+    return "\n".join(lines) or "No tags found."
+
+
+@mcp.tool()
+def sonarr_list_series_by_tag(tag: str) -> str:
+    """List series in Sonarr that have a specific tag (e.g. a requester tag
+    like "2 - bryan"). Use sonarr_list_tags to see available tag labels.
+
+    Args:
+        tag: Exact tag label to filter by (case-insensitive).
+    """
+    all_tags = _sonarr("/tag")
+    if isinstance(all_tags, str):
+        return all_tags
+    ids, unmatched = _resolve_tag_ids(all_tags, tag)
+    if unmatched:
+        valid = ", ".join(t["label"] for t in all_tags)
+        return f"Tag not found: {unmatched[0]}. Valid tags: {valid}"
+    tag_id = ids[0]
+    data = _sonarr("/series")
+    if isinstance(data, str):
+        return data
+    matches = [s for s in data if tag_id in s.get("tags", [])]
+    lines = [
+        f"[id:{s['id']}] {s['title']} ({s.get('year', '?')})" for s in sorted(matches, key=lambda x: x["title"])
+    ]
+    return "\n".join(lines) or f"No series tagged '{tag}'."
+
+
+@mcp.tool()
+def sonarr_set_series_tags(series_id: int, tags: str, mode: str = "add") -> str:
+    """Add, remove, or set tags on a series in Sonarr. Tags that don't exist
+    yet are created automatically (matching add/set mode only).
+
+    Args:
+        series_id: Sonarr series ID (use sonarr_list_series or sonarr_get_series to find it).
+        tags: Comma-separated tag labels (e.g. "2 - bryan,rewatch").
+        mode: "add" to add to existing tags, "remove" to remove named tags,
+            "set" to replace all tags with exactly these (default: "add").
+    """
+    if series_id <= 0:
+        return "Invalid series_id."
+    if mode not in ("add", "remove", "set"):
+        return 'Invalid mode. Use "add", "remove", or "set".'
+    tag_names = [n.strip() for n in tags.split(",") if n.strip()]
+    if not tag_names:
+        return "Provide at least one tag name."
+
+    series = _sonarr(f"/series/{series_id}")
+    if isinstance(series, str):
+        return series
+    all_tags = _sonarr("/tag")
+    if isinstance(all_tags, str):
+        return all_tags
+
+    ids, unmatched = _resolve_tag_ids(all_tags, tags)
+    if mode == "remove" and unmatched:
+        return f"Tag(s) not found: {', '.join(unmatched)}"
+    for label in unmatched:  # add/set: create any tag that doesn't exist yet
+        created = _sonarr("/tag", method="POST", json={"label": label})
+        if isinstance(created, str):
+            return created
+        ids.append(created["id"])
+
+    current = set(series.get("tags", []))
+    if mode == "add":
+        series["tags"] = sorted(current | set(ids))
+    elif mode == "remove":
+        series["tags"] = sorted(current - set(ids))
+    else:  # set
+        series["tags"] = sorted(set(ids))
+
+    result = _sonarr(f"/series/{series_id}", method="PUT", json=series)
+    if isinstance(result, str):
+        return result
+    return f"✅ Tags on '{result['title']}' ({mode}: {', '.join(tag_names)}): now {series['tags']}"
+
+
 # ════════════════════════════════════════════════════════════════
 #  Radarr Tools
 # ════════════════════════════════════════════════════════════════
@@ -1079,7 +1199,7 @@ def sonarr_update_series(series_id: int, quality_profile_id: int = -1, monitored
 
 @mcp.tool()
 def radarr_list_movies() -> str:
-    """List all movies in Radarr with download status and disk usage."""
+    """List all movies in Radarr with download status, disk usage, and tags."""
     data = _radarr("/movie")
     if isinstance(data, str):
         return data
@@ -1089,15 +1209,23 @@ def radarr_list_movies() -> str:
             profiles[p["id"]] = p["name"]
     except Exception:
         pass
+    tag_labels = {}
+    try:
+        for t in _radarr("/tag"):
+            tag_labels[t["id"]] = t["label"]
+    except Exception:
+        pass
     lines = []
     for m in sorted(data, key=lambda x: x["title"]):
         has_file = "✅" if m.get("hasFile") else "❌"
         monitored = "👁" if m.get("monitored") else "⏸️"
         size_gb = m.get("sizeOnDisk", 0) / 1e9
         profile_name = profiles.get(m.get("qualityProfileId"), "?")
+        tags = ", ".join(tag_labels.get(tid, str(tid)) for tid in m.get("tags", []))
+        tags_str = f" [tags: {tags}]" if tags else ""
         lines.append(
             f"{has_file}{monitored} [id:{m['id']}] {m['title']} ({m.get('year', '?')}) — "
-            f"{size_gb:.1f} GB [profile: {profile_name}]"
+            f"{size_gb:.1f} GB [profile: {profile_name}]{tags_str}"
         )
     return "\n".join(lines) or "No movies found."
 
@@ -1118,6 +1246,12 @@ def radarr_get_movie(movie_id: int) -> str:
                 break
     except Exception:
         pass
+    tag_names = []
+    try:
+        tag_labels = {t["id"]: t["label"] for t in _radarr("/tag")}
+        tag_names = [tag_labels.get(tid, str(tid)) for tid in m.get("tags", [])]
+    except Exception:
+        pass
     lines = [
         f"Title: {m['title']} ({m.get('year', '?')})",
         f"Radarr ID: {m['id']}",
@@ -1126,6 +1260,7 @@ def radarr_get_movie(movie_id: int) -> str:
         f"Quality Profile: [{m.get('qualityProfileId', '?')}] {profile_name}",
         f"Has File: {m.get('hasFile', False)}",
         f"Monitored: {m.get('monitored', False)}",
+        f"Tags: {', '.join(tag_names) or 'none'}",
         f"Size: {m.get('sizeOnDisk', 0) / 1e9:.1f} GB",
         f"Path: {m.get('path', '?')}",
         f"TMDB: {m.get('tmdbId', '?')} | IMDB: {m.get('imdbId', '?')}",
@@ -1400,6 +1535,93 @@ def radarr_update_movie(movie_id: int, quality_profile_id: int = -1, monitored: 
         return str(result)
     except httpx.HTTPStatusError as e:
         return f"❌ Failed: {e.response.status_code} — {e.response.text[:200]}"
+
+
+@mcp.tool()
+def radarr_list_tags() -> str:
+    """List all tags defined in Radarr, with how many movies each is applied to.
+    Radarr/Seerr can auto-tag movies by requesting user — useful for scoping
+    actions to what a specific person requested."""
+    data = _radarr("/tag/detail")
+    if isinstance(data, str):
+        return data
+    lines = [f"• [{t['id']}] {t['label']} — {len(t.get('movieIds', []))} movies" for t in data]
+    return "\n".join(lines) or "No tags found."
+
+
+@mcp.tool()
+def radarr_list_movies_by_tag(tag: str) -> str:
+    """List movies in Radarr that have a specific tag (e.g. a requester tag
+    like "2 - bryan"). Use radarr_list_tags to see available tag labels.
+
+    Args:
+        tag: Exact tag label to filter by (case-insensitive).
+    """
+    all_tags = _radarr("/tag")
+    if isinstance(all_tags, str):
+        return all_tags
+    ids, unmatched = _resolve_tag_ids(all_tags, tag)
+    if unmatched:
+        valid = ", ".join(t["label"] for t in all_tags)
+        return f"Tag not found: {unmatched[0]}. Valid tags: {valid}"
+    tag_id = ids[0]
+    data = _radarr("/movie")
+    if isinstance(data, str):
+        return data
+    matches = [m for m in data if tag_id in m.get("tags", [])]
+    lines = [
+        f"[id:{m['id']}] {m['title']} ({m.get('year', '?')})" for m in sorted(matches, key=lambda x: x["title"])
+    ]
+    return "\n".join(lines) or f"No movies tagged '{tag}'."
+
+
+@mcp.tool()
+def radarr_set_movie_tags(movie_id: int, tags: str, mode: str = "add") -> str:
+    """Add, remove, or set tags on a movie in Radarr. Tags that don't exist
+    yet are created automatically (matching add/set mode only).
+
+    Args:
+        movie_id: Radarr movie ID (use radarr_list_movies or radarr_get_movie to find it).
+        tags: Comma-separated tag labels (e.g. "2 - bryan,rewatch").
+        mode: "add" to add to existing tags, "remove" to remove named tags,
+            "set" to replace all tags with exactly these (default: "add").
+    """
+    if movie_id <= 0:
+        return "Invalid movie_id."
+    if mode not in ("add", "remove", "set"):
+        return 'Invalid mode. Use "add", "remove", or "set".'
+    tag_names = [n.strip() for n in tags.split(",") if n.strip()]
+    if not tag_names:
+        return "Provide at least one tag name."
+
+    movie = _radarr(f"/movie/{movie_id}")
+    if isinstance(movie, str):
+        return movie
+    all_tags = _radarr("/tag")
+    if isinstance(all_tags, str):
+        return all_tags
+
+    ids, unmatched = _resolve_tag_ids(all_tags, tags)
+    if mode == "remove" and unmatched:
+        return f"Tag(s) not found: {', '.join(unmatched)}"
+    for label in unmatched:  # add/set: create any tag that doesn't exist yet
+        created = _radarr("/tag", method="POST", json={"label": label})
+        if isinstance(created, str):
+            return created
+        ids.append(created["id"])
+
+    current = set(movie.get("tags", []))
+    if mode == "add":
+        movie["tags"] = sorted(current | set(ids))
+    elif mode == "remove":
+        movie["tags"] = sorted(current - set(ids))
+    else:  # set
+        movie["tags"] = sorted(set(ids))
+
+    result = _radarr(f"/movie/{movie_id}", method="PUT", json=movie)
+    if isinstance(result, str):
+        return result
+    return f"✅ Tags on '{result['title']}' ({mode}: {', '.join(tag_names)}): now {movie['tags']}"
 
 
 @mcp.tool()
