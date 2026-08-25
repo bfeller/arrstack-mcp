@@ -58,6 +58,12 @@ class SecurityTests(unittest.TestCase):
         self.assertEqual(server.seerr_request_movie(0), "Invalid tmdb_id.")
         self.assertEqual(server.seerr_request_tv(-1), "Invalid tmdb_id.")
         self.assertEqual(server.seerr_request_status(0), "Invalid request_id.")
+        self.assertEqual(
+            server.radarr_set_quality_profile_qualities(0, allow="x"), "Invalid profile_id."
+        )
+        self.assertEqual(
+            server.sonarr_set_quality_profile_qualities(-1, allow="x"), "Invalid profile_id."
+        )
 
     def test_dns_rebinding_protection_is_enabled(self):
         settings = server.mcp.settings.transport_security
