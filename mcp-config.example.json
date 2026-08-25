@@ -18,6 +18,8 @@
         "RDT_USER": "admin",
         "RDT_PASS": "your-rdtclient-password",
         "JELLYFIN_URL": "http://localhost:8096",
+        "SEERR_URL": "http://localhost:5055",
+        "SEERR_API_KEY": "your-api-key",
         "PROWLARR_URL": "http://localhost:9696",
         "PROWLARR_API_KEY": "your-api-key",
         "ROMM_URL": "http://localhost:8081",

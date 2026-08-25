@@ -47,6 +47,8 @@ PROWLARR_URL = os.environ.get("PROWLARR_URL", "").rstrip("/")
 PROWLARR_API_KEY = os.environ.get("PROWLARR_API_KEY", "")
 JELLYFIN_URL = os.environ.get("JELLYFIN_URL", "").rstrip("/")
 JELLYFIN_API_KEY = os.environ.get("JELLYFIN_API_KEY", "")
+SEERR_URL = os.environ.get("SEERR_URL", "").rstrip("/")
+SEERR_API_KEY = os.environ.get("SEERR_API_KEY", "")
 ROMM_URL = os.environ.get("ROMM_URL", "").rstrip("/")
 ROMM_API_TOKEN = os.environ.get("ROMM_API_TOKEN", "")
 ROMM_USER = os.environ.get("ROMM_USER", "")
@@ -103,6 +105,7 @@ SERVICE_CONFIG = {
     "rdtclient": ("RDTClient", RDT_URL, "rdt_"),
     "sabnzbd": ("SABnzbd", SAB_URL, "sab_"),
     "jellyfin": ("Jellyfin", JELLYFIN_URL, "jellyfin_"),
+    "seerr": ("Seerr", SEERR_URL, "seerr_"),
     "romm": ("RomM", ROMM_URL, "romm_"),
     "gamevault": ("GameVault", GAMEVAULT_URL, "gamevault_"),
     "bookshelf": ("Bookshelf", BOOKSHELF_URL, "bookshelf_"),
@@ -120,22 +123,7 @@ mcp = FastMCP(
         "Homelab media stack tools for Sonarr (TV), Radarr (Movies), Lidarr (Music), "
         "Prowlarr (Indexers), qBittorrent, RDTClient and SABnzbd (Downloads), Jellyfin (Streaming), "
         "RomM (ROM library), and GameVault (PC game library). "
-        "Use these tools to search, add, and manage media and game libraries.\n\n"
-        "## Hungarian (HuN) / nCore workflow\n"
-        "nCore is a Hungarian private tracker with dual-audio (HuN) releases. "
-        "When the user wants Hungarian releases:\n"
-        "1. Make sure movies/series are on the correct Hungarian quality profile "
-        "(use radarr_list_movies / sonarr_list_series — they show profile names and IDs).\n"
-        "2. IMPORTANT: Dual-audio releases are 2–3× larger than English-only at the same "
-        "quality tier because they carry two full audio tracks. The default 1080p max size "
-        "(~83 MB/min) is too low — raise Bluray-1080p, Remux-1080p, WEBDL-1080p, "
-        "WEBRip-1080p, and HDTV-1080p max to at least 400 MB/min with "
-        "radarr_set_quality_definition / sonarr_set_quality_definition.\n"
-        "3. After triggering a search, always check the queue to verify releases contain "
-        "'HuN' or 'HUN' in the filename. If Radarr/Sonarr grabbed an English-only release, "
-        "delete it from the queue (blocklist=true) and re-search.\n"
-        "4. If existing files need replacing (e.g. English → HuN), delete the movie file "
-        "with radarr_delete_movie_file / sonarr_delete_episode_file first, then search.\n"
+        "Use these tools to search, add, and manage media and game libraries.\n"
     ),
     transport_security=TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
@@ -454,6 +442,25 @@ def _jellyfin(path: str, params=None):
         return r.json()
     except (httpx.HTTPStatusError, httpx.RequestError) as error:
         return _http_error("jellyfin", error)
+
+
+def _seerr(path: str, method: str = "GET", json=None, params=None):
+    if not SEERR_URL:
+        return "Seerr is not configured. Set SEERR_URL and SEERR_API_KEY."
+    logger.info("seerr %s %s", method, path)
+    try:
+        r = httpx.request(
+            method,
+            f"{SEERR_URL}/api/v1{path}",
+            headers={"X-Api-Key": SEERR_API_KEY},
+            json=json,
+            params=params,
+            timeout=30,
+        )
+        r.raise_for_status()
+        return r.json()
+    except (httpx.HTTPStatusError, httpx.RequestError) as error:
+        return _http_error("seerr", error)
 
 
 def _prowlarr(path: str, method: str = "GET", json=None, params=None):
@@ -926,26 +933,9 @@ def sonarr_delete_queue_item(queue_id: int, blocklist: bool = True) -> str:
         return _http_error("sonarr", error)
 
 
-@mcp.tool()
-def sonarr_delete_episode_file(episode_file_id: int) -> str:
-    """Delete a downloaded episode file, marking it as missing in Sonarr.
-    This allows Sonarr to re-search and download a new version.
-
-    Args:
-        episode_file_id: Episode file ID (use sonarr_get_series to find file IDs).
-    """
-    if episode_file_id <= 0:
-        return "Invalid episode_file_id."
-    try:
-        r = httpx.delete(
-            f"{SONARR_URL}/api/v3/episodefile/{episode_file_id}",
-            headers={"X-Api-Key": SONARR_API_KEY},
-            timeout=30,
-        )
-        r.raise_for_status()
-        return f"✅ Deleted episode file (id: {episode_file_id}). Episode is now marked as missing."
-    except (httpx.HTTPStatusError, httpx.RequestError) as error:
-        return _http_error("sonarr", error)
+# Intentionally no sonarr_delete_episode_file tool: deleting library media is
+# done in the Jellyfin app, not via chat. See radarr_delete_movie_file's
+# removal note below for the same reasoning.
 
 
 @mcp.tool()
@@ -1249,33 +1239,12 @@ def radarr_delete_queue_item(queue_id: int, blocklist: bool = True) -> str:
         return _http_error("radarr", error)
 
 
-@mcp.tool()
-def radarr_delete_movie_file(movie_id: int) -> str:
-    """Delete the downloaded file for a movie, marking it as missing in Radarr.
-    This allows Radarr to re-search and download a new version.
-
-    Args:
-        movie_id: Radarr movie ID (use radarr_list_movies or radarr_get_movie to find it).
-    """
-    if movie_id <= 0:
-        return "Invalid movie_id."
-    movie = _radarr(f"/movie/{movie_id}")
-    if isinstance(movie, str):
-        return movie
-    movie_file = movie.get("movieFile")
-    if not movie_file:
-        return f"Movie '{movie.get('title', '?')}' has no file to delete."
-    fid = movie_file.get("id")
-    try:
-        r = httpx.delete(
-            f"{RADARR_URL}/api/v3/moviefile/{fid}",
-            headers={"X-Api-Key": RADARR_API_KEY},
-            timeout=30,
-        )
-        r.raise_for_status()
-        return f"✅ Deleted file for '{movie['title']}' (file id: {fid}). Movie is now marked as missing."
-    except (httpx.HTTPStatusError, httpx.RequestError) as error:
-        return _http_error("radarr", error)
+# Intentionally no radarr_delete_movie_file tool: deleting media from the
+# library is a permanent, hard-to-reverse action. Users delete movies/episodes
+# in the Jellyfin app instead, where it's a deliberate, visible click rather
+# than something an LLM can trigger via chat. This MCP server stays additive
+# (search/request/add) plus download-pipeline management (queue/torrent
+# deletes below), never library-content deletion.
 
 
 @mcp.tool()
@@ -2341,6 +2310,128 @@ def jellyfin_scan_library() -> str:
         return "✅ Library scan triggered."
     except (httpx.HTTPStatusError, httpx.RequestError) as error:
         return _http_error("jellyfin", error)
+
+
+# ════════════════════════════════════════════════════════════════
+#  Seerr Tools
+# ════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+def seerr_search(term: str) -> str:
+    """Search Seerr for movies and TV shows. Returns title, year, media type,
+    TMDB ID, and overview — use the TMDB ID with seerr_request_movie /
+    seerr_request_tv to request it."""
+    data = _seerr("/search", params={"query": term})
+    if isinstance(data, str):
+        return data
+    lines = []
+    for r in data.get("results", [])[:10]:
+        media_type = r.get("mediaType")
+        if media_type not in ("movie", "tv"):
+            continue
+        title = r.get("title") or r.get("name") or "?"
+        date = r.get("releaseDate") or r.get("firstAirDate") or ""
+        year = date[:4] if date else "?"
+        overview = (r.get("overview") or "No description.")[:150]
+        lines.append(
+            f"• {title} ({year}) [tmdbId: {r.get('id', '?')}, type: {media_type}]\n  {overview}"
+        )
+    return "\n".join(lines) or "No results found."
+
+
+@mcp.tool()
+def seerr_request_movie(tmdb_id: int) -> str:
+    """Request a movie in Seerr by its TMDB ID. Use seerr_search to find the TMDB ID first.
+
+    Args:
+        tmdb_id: The TMDB ID of the movie.
+    """
+    if tmdb_id <= 0:
+        return "Invalid tmdb_id."
+    data = _seerr("/request", method="POST", json={"mediaType": "movie", "mediaId": tmdb_id})
+    if isinstance(data, str):
+        return data
+    status = data.get("status", "?")
+    return f"✅ Requested movie (tmdbId: {tmdb_id}). Request id: {data.get('id', '?')}, status: {status}."
+
+
+@mcp.tool()
+def seerr_request_tv(tmdb_id: int, seasons: str = "all") -> str:
+    """Request a TV show in Seerr by its TMDB ID. Use seerr_search to find the TMDB ID first.
+
+    Args:
+        tmdb_id: The TMDB ID of the show.
+        seasons: "all" for every season, or a comma-separated list of season
+            numbers (e.g. "1,2,3").
+    """
+    if tmdb_id <= 0:
+        return "Invalid tmdb_id."
+    if seasons.strip().lower() == "all":
+        season_payload = "all"
+    else:
+        try:
+            season_payload = [int(s.strip()) for s in seasons.split(",") if s.strip()]
+        except ValueError:
+            return "Invalid seasons. Use \"all\" or a comma-separated list like \"1,2,3\"."
+        if not season_payload:
+            return "Invalid seasons. Use \"all\" or a comma-separated list like \"1,2,3\"."
+    data = _seerr(
+        "/request",
+        method="POST",
+        json={"mediaType": "tv", "mediaId": tmdb_id, "seasons": season_payload},
+    )
+    if isinstance(data, str):
+        return data
+    status = data.get("status", "?")
+    return f"✅ Requested TV show (tmdbId: {tmdb_id}, seasons: {seasons}). Request id: {data.get('id', '?')}, status: {status}."
+
+
+@mcp.tool()
+def seerr_list_requests(filter: str = "pending") -> str:
+    """List media requests in Seerr.
+
+    Args:
+        filter: One of "all", "approved", "available", "pending", "processing",
+            "unavailable", "failed" (default: "pending").
+    """
+    data = _seerr("/request", params={"filter": filter, "take": 20})
+    if isinstance(data, str):
+        return data
+    results = data.get("results", [])
+    lines = []
+    for r in results:
+        media = r.get("media", {})
+        lines.append(
+            f"• request id: {r.get('id', '?')} | type: {media.get('mediaType', '?')} "
+            f"| tmdbId: {media.get('tmdbId', '?')} | status: {r.get('status', '?')} "
+            f"| requested by: {r.get('requestedBy', {}).get('displayName', '?')}"
+        )
+    return "\n".join(lines) or f"No {filter} requests."
+
+
+@mcp.tool()
+def seerr_request_status(request_id: int) -> str:
+    """Get the status of a specific Seerr request.
+
+    Args:
+        request_id: Seerr request ID (use seerr_list_requests to find it).
+    """
+    if request_id <= 0:
+        return "Invalid request_id."
+    data = _seerr(f"/request/{request_id}")
+    if isinstance(data, str):
+        return data
+    media = data.get("media", {})
+    return (
+        f"Request id: {data.get('id', '?')}\n"
+        f"Type: {media.get('mediaType', '?')}\n"
+        f"TMDB ID: {media.get('tmdbId', '?')}\n"
+        f"Status: {data.get('status', '?')}\n"
+        f"Media status: {media.get('status', '?')}\n"
+        f"Requested by: {data.get('requestedBy', {}).get('displayName', '?')}\n"
+        f"Created: {data.get('createdAt', '?')}"
+    )
 
 
 # ════════════════════════════════════════════════════════════════

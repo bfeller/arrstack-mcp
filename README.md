@@ -20,6 +20,7 @@ Works with **Claude Desktop**, **Cursor**, **VS Code Copilot**, **OpenClaw**, an
 | **SABnzbd** | Queue, history, status, pause/resume, add NZB url, speed limit |
 | **RDTClient** | Real-Debrid downloader: list/pause/resume/delete torrents, add magnets, provider status |
 | **Jellyfin** | List libraries, recent additions, system info |
+| **Seerr** | Search movies/TV, request media (with season selection), list/check requests |
 | **RomM** | System info, list platforms, list/search ROMs, game details |
 | **GameVault** | List/search PC games, game details, random game, reindex library |
 | **Bookshelf** | List/search authors & books, queue, missing, profiles, health |
@@ -146,6 +147,8 @@ All configuration is done via environment variables:
 | `RDT_PASS` | If RDT login | RDTClient password |
 | `JELLYFIN_URL` | No | Jellyfin base URL (e.g. `http://localhost:8096`) |
 | `JELLYFIN_API_KEY` | No | Jellyfin API key (optional, for authenticated endpoints) |
+| `SEERR_URL` | No | Seerr base URL (e.g. `http://localhost:5055`) |
+| `SEERR_API_KEY` | If Seerr | Seerr API key (Settings → General) |
 | `PROWLARR_URL` | No | Prowlarr base URL (e.g. `http://localhost:9696`) |
 | `PROWLARR_API_KEY` | If Prowlarr | Prowlarr API key (Settings → General) |
 | `ROMM_URL` | No | RomM base URL (e.g. `http://localhost:8081`) |
@@ -268,6 +271,16 @@ API, so it slots into Sonarr/Radarr just like qBt.
 | `jellyfin_libraries` | List media libraries |
 | `jellyfin_recent` | Recently added items |
 | `jellyfin_system_info` | Server version and system info |
+
+### Seerr (Media Requests)
+
+| Tool | Description |
+|------|-------------|
+| `seerr_search` | Search movies and TV shows, returns TMDB IDs |
+| `seerr_request_movie` | Request a movie by TMDB ID |
+| `seerr_request_tv` | Request a TV show by TMDB ID, with optional season selection |
+| `seerr_list_requests` | List requests, filterable by status |
+| `seerr_request_status` | Get the status of a specific request |
 
 ### RomM (ROM Library)
 
@@ -490,6 +503,7 @@ is unset). See [`examples/`](examples/) for sample output.
 - **RDTClient**: Settings → General → Authentication (or set
   `Authentication: None` to allow open access on a trusted network)
 - **Jellyfin**: Dashboard → API Keys → Add
+- **Seerr**: Settings → General → API Key
 - **RomM**: User profile → API Tokens, or configure `ROMM_USER` and `ROMM_PASS`
 - **GameVault**: Admin panel → API Keys
 - **Bookshelf**: Settings → General → API Key (same as Readarr)
