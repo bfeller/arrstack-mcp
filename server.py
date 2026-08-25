@@ -305,10 +305,11 @@ def _lidarr(path: str, method: str = "GET", json=None, params=None):
 
 
 _qbt_sid = None
+_qbt_sid_name = "SID"
 
 
 def _qbt(path: str, method: str = "GET", data=None, params=None, files=None, _retry: bool = False):
-    global _qbt_sid
+    global _qbt_sid, _qbt_sid_name
     if not QBT_URL:
         return "qBittorrent is not configured. Set QBT_URL and QBT_PASS."
     logger.info("qbt %s %s", method, path)
@@ -321,12 +322,20 @@ def _qbt(path: str, method: str = "GET", data=None, params=None, files=None, _re
             )
             login.raise_for_status()
             _qbt_sid = login.cookies.get("SID")
+            _qbt_sid_name = "SID"
+            if not _qbt_sid:
+                # qBittorrent 5.0+ names the session cookie QBT_SID_<port>
+                # instead of the legacy plain "SID" — accept either.
+                for name, value in login.cookies.items():
+                    if name == "SID" or name.startswith("QBT_SID_"):
+                        _qbt_sid, _qbt_sid_name = value, name
+                        break
             if not _qbt_sid:
                 return "qBittorrent login failed: no SID cookie returned."
         r = httpx.request(
             method,
             f"{QBT_URL}/api/v2{path}",
-            cookies={"SID": _qbt_sid},
+            cookies={_qbt_sid_name: _qbt_sid},
             data=data,
             params=params,
             files=files,

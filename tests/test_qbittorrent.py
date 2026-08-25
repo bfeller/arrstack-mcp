@@ -192,10 +192,12 @@ class QbtTransportTests(unittest.TestCase):
     def setUp(self):
         self.qbt_url = server.QBT_URL
         self.qbt_sid = server._qbt_sid
+        self.qbt_sid_name = server._qbt_sid_name
 
     def tearDown(self):
         server.QBT_URL = self.qbt_url
         server._qbt_sid = self.qbt_sid
+        server._qbt_sid_name = self.qbt_sid_name
 
     @patch("server.httpx.request")
     @patch("server.httpx.post")
@@ -219,6 +221,33 @@ class QbtTransportTests(unittest.TestCase):
         _, kwargs = request.call_args
         self.assertEqual(kwargs["files"], files)
         self.assertEqual(out, "Ok.")
+
+    @patch("server.httpx.request")
+    @patch("server.httpx.post")
+    def test_qbt_accepts_port_scoped_sid_cookie(self, post, request):
+        # qBittorrent 5.0+ names the session cookie QBT_SID_<port> instead of
+        # the legacy plain "SID" cookie.
+        server.QBT_URL = "http://qbittorrent:8181"
+        server._qbt_sid = None
+        server._qbt_sid_name = "SID"
+        login = Mock()
+        login.cookies.get.return_value = None
+        login.cookies.items.return_value = [("QBT_SID_8181", "abc123")]
+        login.raise_for_status.return_value = None
+        post.return_value = login
+        result = Mock()
+        result.status_code = 200
+        result.text = "[]"
+        result.json.return_value = []
+        result.raise_for_status.return_value = None
+        request.return_value = result
+
+        out = server._qbt("/torrents/info")
+
+        _, kwargs = request.call_args
+        self.assertEqual(kwargs["cookies"], {"QBT_SID_8181": "abc123"})
+        self.assertEqual(server._qbt_sid, "abc123")
+        self.assertEqual(out, [])
 
 
 class MagnetDisplayNameTests(unittest.TestCase):
