@@ -120,6 +120,8 @@ PROWLARR_URL = SETTINGS["PROWLARR_URL"].rstrip("/")
 PROWLARR_API_KEY = SETTINGS["PROWLARR_API_KEY"]
 JELLYFIN_URL = SETTINGS["JELLYFIN_URL"].rstrip("/")
 JELLYFIN_API_KEY = SETTINGS["JELLYFIN_API_KEY"]
+JELLYSTAT_URL = SETTINGS["JELLYSTAT_URL"].rstrip("/")
+JELLYSTAT_API_KEY = SETTINGS["JELLYSTAT_API_KEY"]
 ROMM_URL = SETTINGS["ROMM_URL"].rstrip("/")
 ROMM_API_TOKEN = SETTINGS["ROMM_API_TOKEN"]
 ROMM_USER = SETTINGS["ROMM_USER"]
@@ -178,7 +180,7 @@ SERVICE_ALIASES = dict(config.SERVICE_ALIASES)
 _BASE_INSTRUCTIONS = (
     "Homelab media stack tools for Sonarr (TV), Radarr (Movies), Lidarr (Music), "
     "Prowlarr (Indexers), qBittorrent, RDTClient and SABnzbd (Downloads), Jellyfin (Streaming), "
-    "Seerr (Media requests), Bookshelf (Books), RomM (ROM library), and GameVault (PC game library). "
+    "Jellystat (Watch stats), Seerr (Media requests), Bookshelf (Books), RomM (ROM library), and GameVault (PC game library). "
     "Use these tools to search, add, and manage media and game libraries."
 )
 
@@ -707,6 +709,37 @@ def _tag_labels(fetch) -> dict:
     return {t["id"]: t["label"] for t in data if isinstance(t, dict) and "id" in t}
 
 
+
+def _format_queue_item(r: dict) -> str:
+    """Format one Sonarr/Radarr queue record.
+
+    A download stuck behind an import safety check (Sonarr/Radarr refusing to
+    import because the release contains an executable file, an unexpected
+    file type, a title mismatch, etc.) reports `status: "completed"` — it
+    looks finished, not failed. The actual reason lives in `statusMessages` /
+    `trackedDownloadStatus`, which this surfaces so it isn't silently dropped.
+    """
+    title = r.get("title", "?")
+    status = r.get("status", "?")
+    sizeleft = r.get("sizeleft", 0) / 1e9
+    line = f"• [queueId: {r.get('id', '?')}] {title} — {status} ({sizeleft:.1f} GB remaining)"
+
+    tracked_status = r.get("trackedDownloadStatus")  # "ok" | "warning" | "error"
+    if not tracked_status or tracked_status.lower() == "ok":
+        return line
+
+    messages = [m for block in (r.get("statusMessages") or []) for m in block.get("messages", [])]
+    if r.get("errorMessage"):
+        messages.append(r["errorMessage"])
+    tracked_state = r.get("trackedDownloadState", "?")  # e.g. importPending, importBlocked
+    reason = "; ".join(messages) or "no message provided"
+    line += f"\n  ⚠ {tracked_status}/{tracked_state}: {reason}"
+    indexer = r.get("indexer")
+    if indexer:
+        line += f"\n  (indexer: {indexer}, client: {r.get('downloadClient', '?')})"
+    return line
+
+
 def _resolve_tag_ids(all_tags: list, tags_csv: str):
     """Resolve a comma-separated list of tag labels to their IDs against
     `all_tags` ([{id,label}, ...]). Returns (resolved_ids, unmatched_labels).
@@ -833,6 +866,42 @@ def _seerr(path: str, method: str = "GET", json=None, params=None):
     if not SEERR_URL:
         return "Seerr is not configured. Set SEERR_URL and SEERR_API_KEY."
     return _arr_request("seerr", SEERR_URL, "/api/v1", SEERR_API_KEY, path, method, json, params)
+
+def _jellystat(path: str, method: str = "GET", json=None, params=None):
+    """HTTP helper for Jellystat (Jellyfin watch stats; /stats, x-api-token)."""
+    if not JELLYSTAT_URL:
+        return "Jellystat is not configured. Set JELLYSTAT_URL and JELLYSTAT_API_KEY."
+    logger.info("jellystat %s %s", method, path)
+    headers = {"x-api-token": JELLYSTAT_API_KEY} if JELLYSTAT_API_KEY else {}
+    try:
+        r = httpx.request(
+            method,
+            f"{JELLYSTAT_URL}/stats{path}",
+            headers=headers,
+            json=json,
+            params=params,
+            timeout=30,
+        )
+        r.raise_for_status()
+        return _decode_json("jellystat", r)
+    except (httpx.HTTPStatusError, httpx.RequestError) as error:
+        return _http_error("jellystat", error)
+
+
+def _jellystat_resolve_user(username: str):
+    """Resolve a username (case-insensitive) to its Jellystat/Jellyfin UserId.
+    Returns (user_dict, error_message) — exactly one of the two is None.
+    """
+    users = _jellystat("/getAllUserActivity")
+    if isinstance(users, str):
+        return None, users
+    for u in users:
+        if u.get("UserName", "").lower() == username.lower():
+            return u, None
+    valid = ", ".join(u.get("UserName", "?") for u in users)
+    return None, f"User '{username}' not found. Valid users: {valid}"
+
+
 
 
 # ════════════════════════════════════════════════════════════════
@@ -1127,17 +1196,16 @@ def sonarr_list_custom_formats() -> str:
 
 @mcp.tool()
 def sonarr_queue() -> str:
-    """Show the current Sonarr download queue with status and queue IDs for each item."""
+    """Show the current Sonarr download queue with status and queue IDs for each item.
+    Flags items stuck behind an import warning/error (e.g. an executable file
+    was found in the download, a title mismatch, etc.) with the actual reason
+    Sonarr is refusing to import — use sonarr_delete_queue_item to remove and
+    blocklist a bad release so a different one gets grabbed instead."""
     data = _sonarr("/queue?pageSize=50&includeUnknownSeriesItems=true")
     if isinstance(data, str):
         return data
     records = data.get("records", [])
-    lines = []
-    for r in records:
-        title = r.get("title", "?")
-        status = r.get("status", "?")
-        sizeleft = r.get("sizeleft", 0) / 1e9
-        lines.append(f"• [queueId: {r['id']}] {title} — {status} ({sizeleft:.1f} GB remaining)")
+    lines = [_format_queue_item(r) for r in records]
     return "\n".join(lines) or "Queue is empty."
 
 
@@ -1160,6 +1228,90 @@ def sonarr_delete_queue_item(queue_id: int, blocklist: bool = True) -> str:
         return f"❌ Failed to remove queue item: {result}"
     return "✅ Removed from queue." + (" (blocklisted)" if blocklist else "")
 
+
+
+
+@mcp.tool()
+def sonarr_manual_import(download_id: str = "", folder: str = "", import_mode: str = "auto") -> str:
+    """Manually import a downloaded file Sonarr couldn't auto-import (e.g. a
+    "title mismatch" or "matched by ID" warning shown by sonarr_queue). Uses
+    Sonarr's OWN parsed guess for series/episode/quality and only imports
+    files it's already confident about — anything ambiguous is reported back
+    instead of guessed. Prefer this over sonarr_delete_queue_item when the
+    file is legitimate and just needs the mapping confirmed, since it keeps
+    the file instead of discarding and re-downloading it.
+
+    Args:
+        download_id: The queue item's downloadId (from sonarr_queue's raw
+            data or the download client) to scope the import to one release.
+            Provide this or folder.
+        folder: Absolute path to a specific download folder to scan instead.
+        import_mode: "auto" (Sonarr decides copy/move per its config,
+            default), "move", or "copy".
+    """
+    if not download_id and not folder:
+        return "Provide download_id or folder."
+    if import_mode not in ("auto", "move", "copy"):
+        return 'Invalid import_mode. Use "auto", "move", or "copy".'
+
+    params = {"filterExistingFiles": "true"}
+    if download_id:
+        params["downloadId"] = download_id
+    if folder:
+        params["folder"] = folder
+
+    candidates = _sonarr("/manualimport", params=params)
+    if isinstance(candidates, str):
+        return candidates
+    if not candidates:
+        return "No importable files found."
+
+    ready, unresolved = [], []
+    for c in candidates:
+        episodes = c.get("episodes") or []
+        rejections = [r["reason"] for r in c.get("rejections", []) if r.get("type") == "error"]
+        if c.get("series") and episodes and c.get("quality") and not rejections:
+            ready.append(c)
+        else:
+            reason = "; ".join(rejections) or "Sonarr could not confidently match series/episode"
+            unresolved.append(f"  • {c.get('relativePath', c.get('path', '?'))} — {reason}")
+
+    imported_lines = []
+    if ready:
+        files = [
+            {
+                "path": c["path"],
+                "seriesId": c["series"]["id"],
+                "seasonNumber": c.get("seasonNumber"),
+                "episodeIds": [e["id"] for e in c["episodes"]],
+                "quality": c["quality"],
+                "languages": c.get("languages", []),
+                "releaseGroup": c.get("releaseGroup"),
+                "downloadId": c.get("downloadId"),
+                "indexerFlags": c.get("indexerFlags", 0),
+            }
+            for c in ready
+        ]
+        result = _sonarr(
+            "/command",
+            method="POST",
+            json={"name": "ManualImport", "files": files, "importMode": import_mode},
+        )
+        if isinstance(result, str):
+            return result
+        for c in ready:
+            ep_labels = ", ".join(
+                f"S{c.get('seasonNumber', '?')}E{e.get('episodeNumber', '?')}" for e in c["episodes"]
+            )
+            imported_lines.append(
+                f"✅ Imported '{c.get('relativePath', c['path'])}' → {c['series']['title']} {ep_labels}"
+            )
+
+    lines = imported_lines
+    if unresolved:
+        lines.append(f"⚠ {len(unresolved)} file(s) need manual review (ambiguous match, not imported):")
+        lines.extend(unresolved)
+    return "\n".join(lines) or "No importable files found."
 
 @mcp.tool()
 def sonarr_list_episode_files(series_id: int, season: int = -1) -> str:
@@ -1219,16 +1371,30 @@ def sonarr_search_missing(series_id: int = 0) -> str:
 
 
 @mcp.tool()
-def sonarr_update_series(series_id: int, quality_profile_id: int = -1, monitored: int = -1) -> str:
-    """Update settings for a series in Sonarr (quality profile, monitored status, etc.).
+def sonarr_update_series(
+    series_id: int,
+    quality_profile_id: int = -1,
+    monitored: int = -1,
+    tags: str = "",
+    tags_mode: str = "add",
+) -> str:
+    """Update settings for a series in Sonarr (quality profile, monitored status, tags).
 
     Args:
         series_id: Sonarr series ID (use sonarr_list_series or sonarr_get_series to find it).
         quality_profile_id: New quality profile ID (-1 to keep current).
         monitored: Set to 1 to monitor, 0 to unmonitor (-1 to keep current).
+        tags: Comma-separated tag labels to apply (e.g. "2 - bryan,rewatch").
+            Tags that don't exist yet are created automatically. Leave blank
+            to leave tags unchanged. To remove specific tags instead, use
+            sonarr_set_series_tags with mode="remove".
+        tags_mode: "add" to add to the series' existing tags, "set" to replace
+            all tags with exactly these (default: "add"). Ignored if tags is blank.
     """
     if series_id <= 0:
         return "Invalid series_id."
+    if tags and tags_mode not in ("add", "set"):
+        return 'Invalid tags_mode. Use "add" or "set".'
     series = _sonarr(f"/series/{series_id}")
     if isinstance(series, str):
         return series
@@ -1239,6 +1405,19 @@ def sonarr_update_series(series_id: int, quality_profile_id: int = -1, monitored
     if monitored >= 0:
         series["monitored"] = bool(monitored)
         changes.append(f"monitored → {bool(monitored)}")
+    if tags:
+        all_tags = _sonarr("/tag")
+        if isinstance(all_tags, str):
+            return all_tags
+        ids, unmatched = _resolve_tag_ids(all_tags, tags)
+        for label in unmatched:
+            created = _sonarr("/tag", method="POST", json={"label": label})
+            if isinstance(created, str):
+                return created
+            ids.append(created["id"])
+        current = set(series.get("tags", []))
+        series["tags"] = sorted(current | set(ids)) if tags_mode == "add" else sorted(set(ids))
+        changes.append(f"tags ({tags_mode}: {tags}) → {series['tags']}")
     if not changes:
         return "No changes specified."
     result = _sonarr(f"/series/{series_id}", method="PUT", json=series)
@@ -1332,6 +1511,103 @@ def sonarr_set_series_tags(series_id: int, tags: str, mode: str = "add") -> str:
     if isinstance(result, str):
         return result
     return f"✅ Tags on '{result.get('title') or series.get('title', series_id)}' ({mode}: {', '.join(tag_names)}): now {series['tags']}"
+
+
+
+@mcp.tool()
+def sonarr_health() -> str:
+    """Check Sonarr system health for warnings and errors (indexer issues,
+    download client problems, disk space, import failures, etc.)."""
+    data = _sonarr("/health")
+    if isinstance(data, str):
+        return data
+    if not data:
+        return "✅ No health issues."
+    lines = []
+    for h in data:
+        icon = "⚠️" if h.get("type") == "warning" else "❌"
+        lines.append(f"{icon} {h.get('message', '?')}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def sonarr_list_root_folders() -> str:
+    """List all configured root folders in Sonarr with free space and
+    accessibility. An inaccessible root folder (unmounted drive, permissions
+    change) or a full disk is a common cause of every import silently
+    failing — check this first when nothing is importing and the reason
+    isn't obvious from sonarr_queue."""
+    data = _sonarr("/rootfolder")
+    if isinstance(data, str):
+        return data
+    if not data:
+        return "No root folders configured."
+    # /rootfolder never includes totalSpace (only freeSpace); /diskspace has
+    # both, keyed by mount path, so join on path to get an actual percentage.
+    diskspace = _sonarr("/diskspace")
+    totals_by_path = {d["path"]: d.get("totalSpace", 0) for d in diskspace} if isinstance(diskspace, list) else {}
+    lines = []
+    for r in data:
+        free_gb = r.get("freeSpace", 0) / 1e9
+        total_gb = totals_by_path.get(r.get("path"), 0) / 1e9
+        size = f"{free_gb:.1f}/{total_gb:.1f} GB free" if total_gb else f"{free_gb:.1f} GB free"
+        pct = f" ({free_gb / total_gb * 100:.0f}% free)" if total_gb else ""
+        flag = "" if r.get("accessible", True) else " ⚠ NOT ACCESSIBLE"
+        lines.append(f"• [{r.get('id', '?')}] {r.get('path', '?')} — {size}{pct}{flag}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def sonarr_get_series_history(series_id: int, limit: int = 20) -> str:
+    """Get the grab/import/failure event history for a series in Sonarr.
+    Use this to diagnose why an episode isn't downloading or importing.
+
+    Args:
+        series_id: Sonarr series ID (use sonarr_list_series or sonarr_get_series to find it).
+        limit: Maximum number of most recent events to show (default: 20).
+    """
+    if series_id <= 0:
+        return "Invalid series_id."
+    data = _sonarr("/history/series", params={"seriesId": series_id})
+    if isinstance(data, str):
+        return data
+    if not data:
+        return "No history found for this series."
+    lines = []
+    for event in data[:limit]:
+        quality = (event.get("quality") or {}).get("quality", {}).get("name", "")
+        reason = (event.get("data") or {}).get("message") or (event.get("data") or {}).get("reason")
+        detail = f" — {reason}" if reason else ""
+        lines.append(
+            f"[{event.get('date', '?')}] {event.get('eventType', '?')} "
+            f"({quality or '?'}){detail}: {event.get('sourceTitle', '?')}"
+        )
+    more = f"\n… {len(data) - limit} more events not shown" if len(data) > limit else ""
+    return "\n".join(lines) + more
+
+
+@mcp.tool()
+def sonarr_list_blocklist(limit: int = 20) -> str:
+    """List blocklisted releases in Sonarr — releases that failed and won't
+    be re-grabbed. Useful for diagnosing repeated download failures.
+
+    Args:
+        limit: Maximum number of most recent entries to show (default: 20).
+    """
+    data = _sonarr("/blocklist", params={"pageSize": limit, "sortKey": "date", "sortDirection": "descending"})
+    if isinstance(data, str):
+        return data
+    records = data.get("records", [])
+    total = data.get("totalRecords", len(records))
+    if not records:
+        return "Blocklist is empty."
+    lines = [
+        f"[{r.get('date', '?')}] {r.get('series', {}).get('title') or r.get('sourceTitle', '?')} — "
+        f"{r.get('message', 'no reason given')} (indexer: {r.get('indexer', '?')})"
+        for r in records
+    ]
+    more = f"\n… {total - len(records)} more not shown ({total} total)" if total > len(records) else ""
+    return "\n".join(lines) + more
 
 
 # ════════════════════════════════════════════════════════════════
@@ -1593,17 +1869,16 @@ def radarr_list_custom_formats() -> str:
 
 @mcp.tool()
 def radarr_queue() -> str:
-    """Show the current Radarr download queue with status and queue IDs for each item."""
+    """Show the current Radarr download queue with status and queue IDs for each item.
+    Flags items stuck behind an import warning/error (e.g. an executable file
+    was found in the download, a title mismatch, etc.) with the actual reason
+    Radarr is refusing to import — use radarr_delete_queue_item to remove and
+    blocklist a bad release so a different one gets grabbed instead."""
     data = _radarr("/queue?pageSize=50&includeUnknownMovieItems=true")
     if isinstance(data, str):
         return data
     records = data.get("records", [])
-    lines = []
-    for r in records:
-        title = r.get("title", "?")
-        status = r.get("status", "?")
-        sizeleft = r.get("sizeleft", 0) / 1e9
-        lines.append(f"• [queueId: {r['id']}] {title} — {status} ({sizeleft:.1f} GB remaining)")
+    lines = [_format_queue_item(r) for r in records]
     return "\n".join(lines) or "Queue is empty."
 
 
@@ -1626,6 +1901,84 @@ def radarr_delete_queue_item(queue_id: int, blocklist: bool = True) -> str:
         return f"❌ Failed to remove queue item: {result}"
     return "✅ Removed from queue." + (" (blocklisted)" if blocklist else "")
 
+
+
+
+@mcp.tool()
+def radarr_manual_import(download_id: str = "", folder: str = "", import_mode: str = "auto") -> str:
+    """Manually import a downloaded file Radarr couldn't auto-import (e.g. a
+    "title mismatch" warning shown by radarr_queue). Uses Radarr's OWN parsed
+    guess for movie/quality and only imports files it's already confident
+    about — anything ambiguous is reported back instead of guessed. Prefer
+    this over radarr_delete_queue_item when the file is legitimate and just
+    needs the mapping confirmed, since it keeps the file instead of
+    discarding and re-downloading it.
+
+    Args:
+        download_id: The queue item's downloadId (from radarr_queue's raw
+            data or the download client) to scope the import to one release.
+            Provide this or folder.
+        folder: Absolute path to a specific download folder to scan instead.
+        import_mode: "auto" (Radarr decides copy/move per its config,
+            default), "move", or "copy".
+    """
+    if not download_id and not folder:
+        return "Provide download_id or folder."
+    if import_mode not in ("auto", "move", "copy"):
+        return 'Invalid import_mode. Use "auto", "move", or "copy".'
+
+    params = {"filterExistingFiles": "true"}
+    if download_id:
+        params["downloadId"] = download_id
+    if folder:
+        params["folder"] = folder
+
+    candidates = _radarr("/manualimport", params=params)
+    if isinstance(candidates, str):
+        return candidates
+    if not candidates:
+        return "No importable files found."
+
+    ready, unresolved = [], []
+    for c in candidates:
+        rejections = [r["reason"] for r in c.get("rejections", []) if r.get("type") == "error"]
+        if c.get("movie") and c.get("quality") and not rejections:
+            ready.append(c)
+        else:
+            reason = "; ".join(rejections) or "Radarr could not confidently match this to a movie"
+            unresolved.append(f"  • {c.get('relativePath', c.get('path', '?'))} — {reason}")
+
+    imported_lines = []
+    if ready:
+        files = [
+            {
+                "path": c["path"],
+                "movieId": c["movie"]["id"],
+                "quality": c["quality"],
+                "languages": c.get("languages", []),
+                "releaseGroup": c.get("releaseGroup"),
+                "downloadId": c.get("downloadId"),
+                "indexerFlags": c.get("indexerFlags", 0),
+            }
+            for c in ready
+        ]
+        result = _radarr(
+            "/command",
+            method="POST",
+            json={"name": "ManualImport", "files": files, "importMode": import_mode},
+        )
+        if isinstance(result, str):
+            return result
+        for c in ready:
+            imported_lines.append(
+                f"✅ Imported '{c.get('relativePath', c['path'])}' → {c['movie']['title']}"
+            )
+
+    lines = imported_lines
+    if unresolved:
+        lines.append(f"⚠ {len(unresolved)} file(s) need manual review (ambiguous match, not imported):")
+        lines.extend(unresolved)
+    return "\n".join(lines) or "No importable files found."
 
 @mcp.tool()
 def radarr_delete_movie_file(movie_id: int) -> str:
@@ -1651,16 +2004,30 @@ def radarr_delete_movie_file(movie_id: int) -> str:
 
 
 @mcp.tool()
-def radarr_update_movie(movie_id: int, quality_profile_id: int = -1, monitored: int = -1) -> str:
-    """Update settings for a movie in Radarr (quality profile, monitored status, etc.).
+def radarr_update_movie(
+    movie_id: int,
+    quality_profile_id: int = -1,
+    monitored: int = -1,
+    tags: str = "",
+    tags_mode: str = "add",
+) -> str:
+    """Update settings for a movie in Radarr (quality profile, monitored status, tags).
 
     Args:
         movie_id: Radarr movie ID (use radarr_list_movies or radarr_get_movie to find it).
         quality_profile_id: New quality profile ID (-1 to keep current).
         monitored: Set to 1 to monitor, 0 to unmonitor (-1 to keep current).
+        tags: Comma-separated tag labels to apply (e.g. "2 - bryan,rewatch").
+            Tags that don't exist yet are created automatically. Leave blank
+            to leave tags unchanged. To remove specific tags instead, use
+            radarr_set_movie_tags with mode="remove".
+        tags_mode: "add" to add to the movie's existing tags, "set" to replace
+            all tags with exactly these (default: "add"). Ignored if tags is blank.
     """
     if movie_id <= 0:
         return "Invalid movie_id."
+    if tags and tags_mode not in ("add", "set"):
+        return 'Invalid tags_mode. Use "add" or "set".'
     movie = _radarr(f"/movie/{movie_id}")
     if isinstance(movie, str):
         return movie
@@ -1671,6 +2038,19 @@ def radarr_update_movie(movie_id: int, quality_profile_id: int = -1, monitored: 
     if monitored >= 0:
         movie["monitored"] = bool(monitored)
         changes.append(f"monitored → {bool(monitored)}")
+    if tags:
+        all_tags = _radarr("/tag")
+        if isinstance(all_tags, str):
+            return all_tags
+        ids, unmatched = _resolve_tag_ids(all_tags, tags)
+        for label in unmatched:
+            created = _radarr("/tag", method="POST", json={"label": label})
+            if isinstance(created, str):
+                return created
+            ids.append(created["id"])
+        current = set(movie.get("tags", []))
+        movie["tags"] = sorted(current | set(ids)) if tags_mode == "add" else sorted(set(ids))
+        changes.append(f"tags ({tags_mode}: {tags}) → {movie['tags']}")
     if not changes:
         return "No changes specified."
     result = _radarr(f"/movie/{movie_id}", method="PUT", json=movie)
@@ -1870,6 +2250,101 @@ def radarr_grab_release(index: int) -> str:
         return f"❌ Failed to grab release: {result}"
     note = " (rejected by the quality profile, grabbed anyway)" if release.get("rejected") else ""
     return f"✅ Radarr is downloading: {title}{note}"
+
+
+
+@mcp.tool()
+def radarr_health() -> str:
+    """Check Radarr system health for warnings and errors (indexer issues,
+    download client problems, disk space, import failures, etc.)."""
+    data = _radarr("/health")
+    if isinstance(data, str):
+        return data
+    if not data:
+        return "✅ No health issues."
+    lines = []
+    for h in data:
+        icon = "⚠️" if h.get("type") == "warning" else "❌"
+        lines.append(f"{icon} {h.get('message', '?')}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def radarr_list_root_folders() -> str:
+    """List all configured root folders in Radarr with free space and
+    accessibility. An inaccessible root folder (unmounted drive, permissions
+    change) or a full disk is a common cause of every import silently
+    failing — check this first when nothing is importing and the reason
+    isn't obvious from radarr_queue."""
+    data = _radarr("/rootfolder")
+    if isinstance(data, str):
+        return data
+    if not data:
+        return "No root folders configured."
+    diskspace = _radarr("/diskspace")
+    totals_by_path = {d["path"]: d.get("totalSpace", 0) for d in diskspace} if isinstance(diskspace, list) else {}
+    lines = []
+    for r in data:
+        free_gb = r.get("freeSpace", 0) / 1e9
+        total_gb = totals_by_path.get(r.get("path"), 0) / 1e9
+        size = f"{free_gb:.1f}/{total_gb:.1f} GB free" if total_gb else f"{free_gb:.1f} GB free"
+        pct = f" ({free_gb / total_gb * 100:.0f}% free)" if total_gb else ""
+        flag = "" if r.get("accessible", True) else " ⚠ NOT ACCESSIBLE"
+        lines.append(f"• [{r.get('id', '?')}] {r.get('path', '?')} — {size}{pct}{flag}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def radarr_get_movie_history(movie_id: int, limit: int = 20) -> str:
+    """Get the grab/import/failure event history for a movie in Radarr.
+    Use this to diagnose why a movie isn't downloading or importing.
+
+    Args:
+        movie_id: Radarr movie ID (use radarr_list_movies or radarr_get_movie to find it).
+        limit: Maximum number of most recent events to show (default: 20).
+    """
+    if movie_id <= 0:
+        return "Invalid movie_id."
+    data = _radarr("/history/movie", params={"movieId": movie_id})
+    if isinstance(data, str):
+        return data
+    if not data:
+        return "No history found for this movie."
+    lines = []
+    for event in data[:limit]:
+        quality = (event.get("quality") or {}).get("quality", {}).get("name", "")
+        reason = (event.get("data") or {}).get("message") or (event.get("data") or {}).get("reason")
+        detail = f" — {reason}" if reason else ""
+        lines.append(
+            f"[{event.get('date', '?')}] {event.get('eventType', '?')} "
+            f"({quality or '?'}){detail}: {event.get('sourceTitle', '?')}"
+        )
+    more = f"\n… {len(data) - limit} more events not shown" if len(data) > limit else ""
+    return "\n".join(lines) + more
+
+
+@mcp.tool()
+def radarr_list_blocklist(limit: int = 20) -> str:
+    """List blocklisted releases in Radarr — releases that failed and won't
+    be re-grabbed. Useful for diagnosing repeated download failures.
+
+    Args:
+        limit: Maximum number of most recent entries to show (default: 20).
+    """
+    data = _radarr("/blocklist", params={"pageSize": limit, "sortKey": "date", "sortDirection": "descending"})
+    if isinstance(data, str):
+        return data
+    records = data.get("records", [])
+    total = data.get("totalRecords", len(records))
+    if not records:
+        return "Blocklist is empty."
+    lines = [
+        f"[{r.get('date', '?')}] {r.get('movie', {}).get('title') or r.get('sourceTitle', '?')} — "
+        f"{r.get('message', 'no reason given')} (indexer: {r.get('indexer', '?')})"
+        for r in records
+    ]
+    more = f"\n… {total - len(records)} more not shown ({total} total)" if total > len(records) else ""
+    return "\n".join(lines) + more
 
 
 # ════════════════════════════════════════════════════════════════
@@ -2558,6 +3033,53 @@ def qbt_torrent_details(torrent_hash: str) -> str:
     return "\n".join(lines)
 
 
+
+
+_QBT_TRACKER_STATUS = {
+    0: "disabled",
+    1: "not contacted",
+    2: "working",
+    3: "updating",
+    4: "not working",
+    5: "tracker error",
+    6: "unreachable",
+}
+
+
+@mcp.tool()
+def qbt_torrent_trackers(torrent_hash: str) -> str:
+    """Show per-tracker status for a torrent — reveals why a stalled,
+    0-peer torrent isn't downloading (e.g. "unregistered torrent" on a
+    private tracker, the tracker being down, or it rejecting the client),
+    which qbt_torrent_details doesn't surface. Use this when
+    qbt_list_torrents shows something stuck with no obvious cause.
+    Note: qBittorrent sometimes leaves the tracker's error message blank
+    even when the status itself correctly reports a failure.
+
+    Args:
+        torrent_hash: The info hash of the torrent (from qbt_list_torrents).
+    """
+    trackers = _qbt("/torrents/trackers", params={"hash": torrent_hash})
+    if isinstance(trackers, str):
+        return trackers
+    if not trackers:
+        return "No trackers found for this torrent."
+    lines = []
+    for t in trackers:
+        url = t.get("url", "?")
+        if url.startswith("** ["):  # qBittorrent's synthetic DHT/PeX/LSD rows, not real trackers
+            continue
+        status_code = t.get("status")
+        status = _QBT_TRACKER_STATUS.get(status_code, f"unknown ({status_code})")
+        line = f"• {url} — {status} (seeds: {t.get('num_seeds', 0)}, peers: {t.get('num_peers', 0)})"
+        if status in ("not working", "tracker error", "unreachable"):
+            msg = (t.get("msg") or "").strip()
+            fallback = "no message provided by the tracker (qBittorrent sometimes omits this)"
+            line += f"\n  reason: {msg or fallback}"
+        lines.append(line)
+    return "\n".join(lines) or "No real trackers found (only DHT/PeX/LSD)."
+
+
 @mcp.tool()
 def qbt_add(source: str, category: str = "", save_path: str = "", paused: bool = False) -> str:
     """Add anything to qBittorrent and start downloading immediately.
@@ -2959,6 +3481,106 @@ def jellyfin_scan_library() -> str:
         return _http_error("jellyfin", error)
 
 
+
+# ════════════════════════════════════════════════════════════════
+#  Jellystat Tools
+# ════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+def jellystat_list_users() -> str:
+    """List Jellyfin users with their watch activity summary from Jellystat
+    (last watched, last activity, total plays, total watch time)."""
+    users = _jellystat("/getAllUserActivity")
+    if isinstance(users, str):
+        return users
+    lines = []
+    for u in users:
+        minutes = round((u.get("TotalWatchTime") or 0) / 60)
+        lines.append(
+            f"• {u.get('UserName', '?')} — {u.get('TotalPlays', 0)} plays, ~{minutes} min total\n"
+            f"  Last watched: {u.get('LastWatched') or 'N/A'} ({u.get('LastActivityDate', '?')})"
+        )
+    return "\n".join(lines) or "No user activity found."
+
+
+@mcp.tool()
+def jellystat_most_watched(media_type: str = "Movie", days: int = 30) -> str:
+    """Show the most-watched movies, shows, or music in Jellyfin over a time window.
+
+    Args:
+        media_type: "Movie", "Series", or "Audio" (default: "Movie").
+        days: Lookback window in days (default: 30).
+    """
+    if media_type not in ("Movie", "Series", "Audio"):
+        return 'Invalid media_type. Use "Movie", "Series", or "Audio".'
+    data = _jellystat("/getMostViewedByType", method="POST", json={"days": days, "type": media_type})
+    if isinstance(data, str):
+        return data
+    lines = [f"• {d.get('Name', '?')} — {d.get('Plays', 0)} plays" for d in data]
+    return "\n".join(lines) or f"No {media_type} watch activity in the last {days} days."
+
+
+@mcp.tool()
+def jellystat_most_active_users(days: int = 30) -> str:
+    """Show which Jellyfin users have watched the most in a time window.
+
+    Args:
+        days: Lookback window in days (default: 30).
+    """
+    data = _jellystat("/getMostActiveUsers", method="POST", json={"days": days})
+    if isinstance(data, str):
+        return data
+    lines = [f"• {d.get('Name', '?')} — {d.get('Plays', 0)} plays" for d in data]
+    return "\n".join(lines) or f"No activity in the last {days} days."
+
+
+@mcp.tool()
+def jellystat_user_history(username: str, limit: int = 15) -> str:
+    """Show what a specific Jellyfin user has watched most recently.
+
+    Args:
+        username: Jellyfin username (use jellystat_list_users to see valid names).
+        limit: Maximum number of items to show (default: 15).
+    """
+    user, error = _jellystat_resolve_user(username)
+    if error:
+        return error
+    data = _jellystat("/getUserLastPlayed", method="POST", json={"userid": user["UserId"]})
+    if isinstance(data, str):
+        return data
+    lines = []
+    for d in data[:limit]:
+        title = d.get("Name", "?")
+        if d.get("EpisodeName"):
+            title += f" — S{d.get('SeasonNumber', '?')}E{d.get('EpisodeNumber', '?')}: {d['EpisodeName']}"
+        lines.append(f"• {title}")
+    return "\n".join(lines) or f"No watch history found for {username}."
+
+
+@mcp.tool()
+def jellystat_user_stats(username: str, hours: int = 168) -> str:
+    """Show total plays and watch time for a specific Jellyfin user over a time window.
+
+    Args:
+        username: Jellyfin username (use jellystat_list_users to see valid names).
+        hours: Lookback window in hours (default: 168 = 1 week).
+    """
+    user, error = _jellystat_resolve_user(username)
+    if error:
+        return error
+    data = _jellystat("/getGlobalUserStats", method="POST", json={"hours": hours, "userid": user["UserId"]})
+    if isinstance(data, str):
+        return data
+    if not data:
+        return f"No activity found for {username} in the last {hours}h."
+    minutes = round((data.get("total_playback_duration") or 0) / 60)
+    return (
+        f"{data.get('Name', username)}: {data.get('Plays', 0)} plays, "
+        f"~{minutes} min watched in the last {hours}h"
+    )
+
+
 # ════════════════════════════════════════════════════════════════
 #  Seerr Tools
 # ════════════════════════════════════════════════════════════════
@@ -3275,15 +3897,53 @@ def sab_queue() -> str:
 
 
 @mcp.tool()
-def sab_history() -> str:
-    """Show SABnzbd download history."""
-    return str(_sab("history"))
+def sab_history(limit: int = 20) -> str:
+    """Show recent SABnzbd download history, including the failure reason
+    for anything that didn't complete (corrupt archive, password-protected,
+    an unwanted/blocked file type such as a disguised .exe, etc.).
+
+    Args:
+        limit: Maximum number of most recent entries to show (default: 20).
+    """
+    data = _sab("history", limit=limit)
+    if isinstance(data, str):
+        return data
+    slots = (data.get("history") or {}).get("slots", [])
+    if not slots:
+        return "History is empty."
+    lines = []
+    for s in slots:
+        status = s.get("status", "?")
+        size_gb = s.get("bytes", 0) / 1e9
+        line = f"[{status}] {s.get('name', '?')} — {size_gb:.2f} GB"
+        if status != "Completed" and s.get("fail_message"):
+            line += f"\n  reason: {s['fail_message']}"
+        lines.append(line)
+    return "\n".join(lines)
 
 
 @mcp.tool()
 def sab_status() -> str:
-    """Show SABnzbd full status (server, disk space, speed, etc.)."""
-    return str(_sab("fullstatus"))
+    """Show SABnzbd status: pause state, disk space, and any active
+    warnings — e.g. an "Unwanted Extension" warning, SABnzbd's own filter
+    catching a disguised executable, the same protection Sonarr/Radarr apply
+    on the import side."""
+    data = _sab("fullstatus")
+    if isinstance(data, str):
+        return data
+    status = data.get("status", {})
+    lines = [
+        f"Version: {status.get('version', '?')} | Paused: {status.get('paused', '?')}",
+        f"Disk space: {status.get('diskspace1_norm', '?')} free of {status.get('diskspacetotal1', '?')} GB total",
+    ]
+    warnings = status.get("warnings") or []
+    if warnings:
+        lines.append(f"⚠ {len(warnings)} warning(s):")
+        for w in warnings[:10]:
+            lines.append(f"  • [{w.get('type', '?')}] {w.get('text', '?')}")
+        if len(warnings) > 10:
+            lines.append(f"  … {len(warnings) - 10} more not shown")
+    return "\n".join(lines)
 
 
 @mcp.tool()

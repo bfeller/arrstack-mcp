@@ -54,6 +54,7 @@ else.
 | **SABnzbd** | Queue, history, status, pause/resume, add NZB url, speed limit |
 | **RDTClient** | Real-Debrid downloader: list/pause/resume/delete torrents, add magnets, provider status |
 | **Jellyfin** | List libraries, recent additions, system info |
+| **Jellystat** | User watch stats, most-watched, activity history |
 | **RomM** | System info, list platforms, list/search ROMs, game details |
 | **GameVault** | List/search PC games, game details, random game, reindex library |
 | **Bookshelf** | List/search authors & books, queue, missing, profiles, health |
@@ -276,6 +277,8 @@ stop the server at startup with a list of every problem.
 | `SAB_API_KEY` | If SABnzbd | SABnzbd API key (Config → General → API Key) |
 | `JELLYFIN_URL` | No | Jellyfin base URL (e.g. `http://localhost:8096`) |
 | `JELLYFIN_API_KEY` | No | Jellyfin API key (needed for libraries, recent items and library scans) |
+| `JELLYSTAT_URL` | No | Jellystat base URL (e.g. `http://localhost:3000`) |
+| `JELLYSTAT_API_KEY` | If Jellystat | Jellystat API key (Settings → API) |
 | `ROMM_URL` | No | RomM base URL (e.g. `http://localhost:8081`) |
 | `ROMM_API_TOKEN` | If RomM | RomM bearer token; alternatively use `ROMM_USER` and `ROMM_PASS` |
 | `ROMM_USER` | If RomM basic auth | RomM username |
