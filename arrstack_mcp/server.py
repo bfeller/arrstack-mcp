@@ -13,6 +13,7 @@ import sys
 import json
 import base64
 import argparse
+import copy
 import logging
 import binascii
 from datetime import datetime, timezone
@@ -2465,6 +2466,89 @@ def lidarr_add_artist(
     result = _lidarr("/artist", method="POST", json=artist_data)
     if isinstance(result, dict):
         return f"✅ Added: {result.get('artistName', '?')}"
+    return str(result)
+
+
+def prepare_lidarr_album(album, quality_profile_id, metadata_profile_id, root_folder_path, search=True):
+    """Return a copy that monitors only this album, not the artist's discography."""
+    prepared = copy.deepcopy(album)
+    artist = dict(prepared.get("artist") or {})
+    artist.update(
+        {
+            "qualityProfileId": quality_profile_id,
+            "metadataProfileId": metadata_profile_id,
+            "rootFolderPath": root_folder_path,
+            "monitored": False,
+            "addOptions": {"monitor": "none", "searchForMissingAlbums": False},
+        }
+    )
+    prepared["artist"] = artist
+    prepared["monitored"] = True
+    prepared["addOptions"] = {"searchForNewAlbum": bool(search)}
+    return prepared
+
+
+@mcp.tool()
+def lidarr_add_album(
+    foreign_album_id: str,
+    quality_profile_id: int,
+    metadata_profile_id: int,
+    root_folder_path: str,
+    search: bool = True,
+) -> str:
+    """Add one album by MusicBrainz release-group id.
+
+    The artist is added unmonitored. Only this album is monitored and searched.
+    Use lidarr_search_album to find the id, or pass a release-group MBID directly.
+
+    Args:
+        foreign_album_id: MusicBrainz release-group id.
+        quality_profile_id: Quality profile (use lidarr_list_quality_profiles).
+        metadata_profile_id: Metadata profile (use lidarr_list_metadata_profiles).
+        root_folder_path: Root folder path (use lidarr_list_root_folders).
+        search: Search indexers for this album after adding it.
+    """
+    foreign_album_id = (foreign_album_id or "").strip()
+    if len(foreign_album_id) < 36:
+        return "Invalid foreign_album_id."
+    if not LIDARR_URL:
+        return "Lidarr is not configured. Set LIDARR_URL and LIDARR_API_KEY."
+
+    existing = _arr_request(
+        "lidarr", LIDARR_URL, "/api/v1", LIDARR_API_KEY,
+        "/album", params={"foreignAlbumId": foreign_album_id}, timeout=60,
+    )
+    if isinstance(existing, list) and existing:
+        album = existing[0]
+        title = album.get("title") or foreign_album_id
+        files = (album.get("statistics") or {}).get("trackFileCount") or 0
+        if search and files <= 0:
+            _arr_request(
+                "lidarr", LIDARR_URL, "/api/v1", LIDARR_API_KEY,
+                "/command", "POST", {"name": "AlbumSearch", "albumIds": [album["id"]]}, timeout=60,
+            )
+            return f"Already in Lidarr: {title}. Search started."
+        return f"Already in Lidarr: {title}."
+
+    lookup = _arr_request(
+        "lidarr", LIDARR_URL, "/api/v1", LIDARR_API_KEY,
+        "/album/lookup", params={"term": f"lidarr:{foreign_album_id}"}, timeout=90,
+    )
+    if isinstance(lookup, str):
+        return lookup
+    match = next((item for item in lookup or [] if item.get("foreignAlbumId") == foreign_album_id), None)
+    if match is None:
+        return f"Lidarr did not find release group {foreign_album_id}."
+    payload = prepare_lidarr_album(
+        match, quality_profile_id, metadata_profile_id, root_folder_path, search
+    )
+    result = _arr_request(
+        "lidarr", LIDARR_URL, "/api/v1", LIDARR_API_KEY,
+        "/album", "POST", payload, timeout=180,
+    )
+    if isinstance(result, dict):
+        artist = (result.get("artist") or {}).get("artistName") or "?"
+        return f"✅ Added album: {result.get('title', '?')} — {artist}"
     return str(result)
 
 
